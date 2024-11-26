@@ -22,6 +22,10 @@ THE SOFTWARE.
 
 import functools
 from io import BytesIO
+from asyncio import Queue
+import asyncio
+import threading
+
 
 import cv2
 from cv_bridge import CvBridge
@@ -32,10 +36,13 @@ import rclpy
 from rclpy.node import Node, ParameterDescriptor
 from sensor_msgs.msg import Image, NavSatFix
 from std_msgs.msg import Header, String
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 
-from telegram import Location, ReplyKeyboardMarkup
+from telegram import Location, ReplyKeyboardMarkup, Bot
 from telegram.error import TimedOut
-from telegram.ext import CommandHandler, Filters, MessageHandler, Updater
+from telegram.ext import CommandHandler, filters, MessageHandler, Updater, Application
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 
 
 class TelegramBridge(Node):
@@ -51,82 +58,76 @@ class TelegramBridge(Node):
                                ParameterDescriptor(type=ParameterType.PARAMETER_BOOL,
                                                    description='When receiving a picture, '
                                                                'put the caption in the frame_id'))
-        self._caption_as_frame_id = self.get_parameter_or('caption_as_frame_id', False).value
+        self._caption_as_frame_id = self.get_parameter('caption_as_frame_id').value
 
         self.declare_parameter('api_token', '',
                                ParameterDescriptor(type=ParameterType.PARAMETER_STRING,
                                                    description='Telegram API token. '
                                                                'Get your own via '
                                                                'https://t.me/botfather'))
-        self._telegram_updater = Updater(token=self.get_parameter('api_token').value,
-                                         use_context=True)
-        dp = self._telegram_updater.dispatcher
+        
+        queue = Queue()
+        token=self.get_parameter('api_token').value
+        bot = Bot(token=token)
+        self._telegram_updater = Updater(bot=bot, update_queue=queue)
+        dp = Application.builder().updater(self._telegram_updater).build()
 
         dp.add_error_handler(lambda _, update, error:
                              self.get_logger().error(
                                  'Update {} caused error {}'.format(update, error)))
 
         self.declare_parameter('whitelist', False,
-                               ParameterDescriptor(type=ParameterType.PARAMETER_INTEGER_ARRAY,
-                                                   description='list of accepted chat IDs'))
+                               ParameterDescriptor(description='list of accepted chat IDs'))
         self.declare_parameter('blacklist', False,
-                               ParameterDescriptor(type=ParameterType.PARAMETER_INTEGER_ARRAY,
-                                                   description='list of unaccepted chat IDs'))
-        self.declare_parameter('commandList', [''],
-                       ParameterDescriptor(type=ParameterType.PARAMETER_STRING_ARRAY,
-                                           description="List of commands with their descriptions"))
-        
+                               ParameterDescriptor(description='list of unaccepted chat IDs'))
 
-        self.get_logger().info('Initial whitelist: {}'
-                               .format(self.get_parameter('whitelist').value))
-        self.get_logger().info('Initial blacklist: {}'
-                               .format(self.get_parameter('blacklist').value))
+        whitelist = self.get_parameter('whitelist').get_parameter_value().integer_array_value
+        blacklist = self.get_parameter('blacklist').get_parameter_value().integer_array_value
+
+
+        self.get_logger().info('Initial whitelist: {}'.format(whitelist))
+        self.get_logger().info('Initial blacklist: {}'.format(blacklist))
+
 
         dp.add_handler(CommandHandler('start', self._telegram_start_callback))
         dp.add_handler(CommandHandler('stop', self._telegram_stop_callback))
-        
-        commandList = []
-        commandListStr = self.get_parameter('commandList').value
-        if not commandListStr:
-            commandListStr = []
-        for command in commandListStr:
-            # split by : to get the command and the description
-            command = command.split(':')
-            commandList.append((command[0], command[1]))
 
-
-        self._telegram_updater.bot.set_my_commands(commandList)
-        
         self._from_telegram_string_publisher = self.create_publisher(
             String, 'message_to_ros', 10)
         self._from_ros_string_subscriber = self.create_subscription(
             String, 'message_from_ros', self._ros_message_callback, 10)
-        dp.add_handler(MessageHandler(Filters.text, self._telegram_message_callback))
+        dp.add_handler(MessageHandler(filters.TEXT, self._telegram_message_callback))
 
         self._from_telegram_image_publisher = self.create_publisher(
             Image, 'image_to_ros', 10)
         self._from_ros_image_subscriber = self.create_subscription(
             Image, 'image_from_ros', self._ros_image_callback, 10)
-        dp.add_handler(MessageHandler(Filters.photo, self._telegram_image_callback))
+        dp.add_handler(MessageHandler(filters.PHOTO, self._telegram_image_callback))
 
         self._from_telegram_location_publisher = self.create_publisher(
             NavSatFix, 'location_to_ros', 10)
         self._to_telegram_location_subscriber = self.create_subscription(
             NavSatFix, 'location_from_ros', self._ros_location_callback, 10)
-        dp.add_handler(MessageHandler(Filters.location, self._telegram_location_callback))
+        dp.add_handler(MessageHandler(filters.LOCATION, self._telegram_location_callback))
 
         self._to_telegram_options_subscriber = self.create_subscription(
             Options, 'options_from_ros', self._ros_options_callback, 10)
         
-
+        self.dp = dp
+        
     def start(self):
         self.get_logger().info('Start polling Telegram updater')
-        self._telegram_updater.start_polling()
+        
+        # self.dp.run_polling()
+        future = asyncio.wait([self.dp.run_polling()])
+        rclpy.spin_until_future_complete(self, future)
+        # asyncio.get_event_loop().run_until_complete(future)
+        # self._telegram_updater.start_polling()
         self.get_logger().info('Started polling Telegram updater')
 
     def stop(self):
         self.get_logger().info('Stopping Telegram updater')
-        self._telegram_updater.stop()
+        # self._telegram_updater.stop()
         self.get_logger().info('Stopped Telegram updater')
 
     def __enter__(self):
@@ -199,7 +200,7 @@ class TelegramBridge(Node):
         :return:
         """
         # If the whitelist is empty, it is disabled and anyone is allowed.
-        whitelist = self.get_parameter_or('whitelist', []).value
+        whitelist = self.get_parameter('whitelist').get_parameter_value().integer_array_value
         self.get_logger().debug('Whitelist: {}'.format(whitelist))
         if whitelist:
             whitelisted = chat_id in whitelist
@@ -220,7 +221,7 @@ class TelegramBridge(Node):
         # TODO: Getting default params or List params at all doesn't seem to
         # work in the way I expect at least. If the value is defined as [] in yaml,
         # still returns None here
-        blacklist = self.get_parameter_or('blacklist', alternative_value=[]).value
+        blacklist = self.get_parameter('blacklist').get_parameter_value().integer_array_value
         if blacklist:
             self.get_logger().debug('Blacklist: {}'.format(blacklist))
             blacklisted = chat_id in blacklist
@@ -229,7 +230,7 @@ class TelegramBridge(Node):
             return blacklisted
         return False
 
-    def _telegram_start_callback(self, update, context):
+    async def _telegram_start_callback(self, update, context):
         """
         Call when a telegram user sends the '/start' event to the bot.
 
@@ -241,25 +242,25 @@ class TelegramBridge(Node):
                 not self.is_blacklisted(update.message.chat_id):
             self.get_logger().warn('Discarding message. User {} not whitelisted'
                                    .format(update.message.from_user))
-            update.message.reply_text('You (chat id {}) are not authorized to cha'
+            await update.message.reply_text('You (chat id {}) are not authorized to cha'
                                       't with this bot'.format(update.message.from_user['id']))
             return
 
         if self._telegram_chat_id is not None and self._telegram_chat_id != update.message.chat_id:
             self.get_logger().warn('Changing to different chat_id!')
-            self._telegram_updater.bot.send_message(
+            await self._telegram_updater.bot.send_message(
                 self._telegram_chat_id,
                 'Lost ROS bridge connection to this chat_id (somebody took over)')
         self._telegram_chat_id = update.message.chat_id
 
         self.get_logger().info('Starting telegram ROS bridge for chat id {}'
                                .format(self._telegram_chat_id))
-        update.message.reply_text(
+        await update.message.reply_text(
             'Telegram ROS bridge initialized, only replying to chat_id {} (current). '
             'Type /stop to disconnect'.format(self._telegram_chat_id))
 
     @telegram_callback
-    def _telegram_stop_callback(self, update, context):
+    async def _telegram_stop_callback(self, update, context):
         """
         Call when a telegram user sends the '/stop' event to the bot.
 
@@ -269,12 +270,12 @@ class TelegramBridge(Node):
         """
         self.get_logger().info('Stopping telegram ROS bridge for chat id {}'
                                .format(self._telegram_chat_id))
-        update.message.reply_text('Disconnecting chat_id {}. So long and thanks for all the fish!'
+        await update.message.reply_text('Disconnecting chat_id {}. So long and thanks for all the fish!'
                                   ' Type /start to reconnect'.format(self._telegram_chat_id))
         self._telegram_chat_id = None
 
     @telegram_callback
-    def _telegram_message_callback(self, update, context):
+    async def _telegram_message_callback(self, update, context):
         """
         Call when a new telegram message has been received.
 
@@ -284,16 +285,16 @@ class TelegramBridge(Node):
         """
         self.get_logger().info('Got a message: {}'.format(update))
         self._from_telegram_string_publisher.publish(String(data=update.message.text))
-        
+
     @ros_callback
-    def _ros_message_callback(self, msg):
+    async def _ros_message_callback(self, msg):
         """
         Call when a new ROS String message should be sent to the Telegram session.
 
         :config msg: String message
         """
         self.get_logger().info(str(msg.data))
-        self._telegram_updater.bot.send_message(self._telegram_chat_id, msg.data)
+        await self._telegram_updater.bot.send_message(self._telegram_chat_id, msg.data)
 
     @telegram_callback
     def _telegram_image_callback(self, update, context):
@@ -397,6 +398,6 @@ def main(args=None):
     bridge.destroy_node()
     rclpy.shutdown()
 
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    future = asyncio.wait([main()])
+    asyncio.get_event_loop().run_until_complete(future)

@@ -2,7 +2,8 @@
 
 # telegram_ros2
 Bridge the Telegram chat service to ROS2. Send messages, images, locations to and from ROS2
-
+Only works with specific version
+pip3 install python-telegram-bot==13.15
 ## Useage
 ```bash
 mkdir -p ~/dev_ws/src
