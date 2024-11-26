@@ -66,10 +66,10 @@ class TelegramBridge(Node):
                              self.get_logger().error(
                                  'Update {} caused error {}'.format(update, error)))
 
-        self.declare_parameter('whitelist', False,
+        self.declare_parameter('whitelist', [0],
                                ParameterDescriptor(type=ParameterType.PARAMETER_INTEGER_ARRAY,
                                                    description='list of accepted chat IDs'))
-        self.declare_parameter('blacklist', False,
+        self.declare_parameter('blacklist', [0],
                                ParameterDescriptor(type=ParameterType.PARAMETER_INTEGER_ARRAY,
                                                    description='list of unaccepted chat IDs'))
         self.declare_parameter('commandList', [''],
