@@ -77,8 +77,9 @@ class TelegramBridge(Node):
                                            description="List of commands with their descriptions"))
         
 
+        self.whitelist = self.get_parameter('whitelist').value
         self.get_logger().info('Initial whitelist: {}'
-                               .format(self.get_parameter('whitelist').value))
+                               .format(self.whitelist))
         self.get_logger().info('Initial blacklist: {}'
                                .format(self.get_parameter('blacklist').value))
 
@@ -101,6 +102,8 @@ class TelegramBridge(Node):
             String, 'message_to_ros', 10)
         self._from_ros_string_subscriber = self.create_subscription(
             String, 'message_from_ros', self._ros_message_callback, 10)
+        self._from_ros_broadcast = self.create_subscription(
+            String, 'broadcast_from_ros', self._ros_broadcast_callback, 10)
         dp.add_handler(MessageHandler(Filters.text, self._telegram_message_callback))
 
         self._from_telegram_image_publisher = self.create_publisher(
@@ -199,7 +202,7 @@ class TelegramBridge(Node):
         :return:
         """
         # If the whitelist is empty, it is disabled and anyone is allowed.
-        whitelist = self.get_parameter_or('whitelist', []).value
+        whitelist = self.whitelist
         self.get_logger().debug('Whitelist: {}'.format(whitelist))
         if whitelist:
             whitelisted = chat_id in whitelist
@@ -294,6 +297,17 @@ class TelegramBridge(Node):
         """
         self.get_logger().info(str(msg.data))
         self._telegram_updater.bot.send_message(self._telegram_chat_id, msg.data)
+        
+        
+    def _ros_broadcast_callback(self, msg):
+        """
+        Call when a new ROS String message should be sent to the Telegram session.
+
+        :config msg: String message
+        """
+        self.get_logger().info(str(msg.data))
+        for chat_id in self.whitelist:
+            self._telegram_updater.bot.send_message(chat_id, msg.data)
 
     @telegram_callback
     def _telegram_image_callback(self, update, context):
